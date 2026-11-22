@@ -1,4 +1,4 @@
-""Apex-V12 — V11 + Observed-Laser Cooldown Ledger (unseen = UNSAFE), 0.28 s Charge Threshold, Barrel-Origin Laser Jiggle-Peek & Barrel-Gated Dual-Fire."""
+"""Apex-V12 — V11 + Observed-Laser Cooldown Ledger (unseen = UNSAFE), 0.28 s Charge Threshold, Barrel-Origin Laser Jiggle-Peek & Barrel-Gated Dual-Fire."""
 from __future__ import annotations
 
 import json
