@@ -1,10 +1,11 @@
-"""Apex-V11 — Persistent World Memory, Rooftop Hysteresis & Edge-Lock, Laser Charge-Window Counter, Multi-Ring Cover & Dual-Fire."""
+""Apex-V12 — V11 + Observed-Laser Cooldown Ledger (unseen = UNSAFE), 0.28 s Charge Threshold, Barrel-Origin Laser Jiggle-Peek & Barrel-Gated Dual-Fire."""
 from __future__ import annotations
 
 import json
 import math
 import os
 import random
+import time
 from typing import Dict, List, Optional, Tuple
 
 import mechfight as mf
@@ -238,6 +239,23 @@ class ArenaMap:
                 return False
         return True
 
+    def barrel_clear(
+        self, muzzle: List[float], yaw: float, pitch: float, shot_offset: float, target: List[float], step_m: float = 2.0
+    ) -> bool:
+        """Server firing geometry: shot emerges shot_offset (= radius + 0.5) ahead of the muzzle along the REAL aim.
+        True only if that short barrel segment is open AND the ray from the emergence point reaches target."""
+        cp = math.cos(pitch)
+        ux = cp * math.cos(yaw)
+        uy = cp * math.sin(yaw)
+        uz = math.sin(pitch)
+        n = max(2, int(math.ceil(shot_offset / 0.5)))
+        for i in range(1, n + 1):
+            s = shot_offset * i / n
+            if self.is_solid(muzzle[0] + ux * s, muzzle[1] + uy * s, muzzle[2] + uz * s):
+                return False
+        origin = [muzzle[0] + ux * shot_offset, muzzle[1] + uy * shot_offset, muzzle[2] + uz * shot_offset]
+        return self.has_los(origin, target, step_m=step_m)
+
     def arc_clear(self, muzzle: List[float], yaw: float, pitch: float, speed: float, g: float, flight_t: float) -> bool:
         vx = speed * math.cos(pitch) * math.cos(yaw)
         vy = speed * math.cos(pitch) * math.sin(yaw)
@@ -280,7 +298,13 @@ UPGRADE_TIER: Dict[str, float] = {
 
 
 class Bot:
-    name = "Apex-V11"
+    name = "Apex-V12"
+
+    # A/B switches and tunables
+    ENABLE_PEEK = True
+    ENABLE_LEDGER_ROOF = True
+    PEEK_MARGIN = 0.35        # 0.10 release latency + 0.25 safety on top of the exposure window
+    LASER_DANGER_T = 0.28     # enemy laser charge elapsed (s) at which we treat it as lethal (2x laser_charge => 0.42 s total)
 
     def __init__(self, hello: mf.Hello):
         self.slot = int(hello["slot"])
@@ -317,6 +341,22 @@ class Bot:
         self.mem_enemies: Dict[int, Tuple[List[float], float]] = {}      # id -> (pos, seen_t)
         self.enemy_charge_start: Dict[int, float] = {}                   # id -> t when laser charging began
         self.climbing_roof: Optional[Tuple[float, float, float]] = None  # Hysteresis roof climb target
+
+        # V12 Upgrade C: observed-laser cooldown ledger (beams carry shooter id => exact; absent id => UNSAFE)
+        self.enemy_laser_ready: Dict[int, float] = {}                    # id -> t when that enemy's laser is ready again
+        self.laser_cd = float(self.cfg.get("weapons", {}).get("laser", {}).get("cooldown", 1.65))
+
+        # V12 Upgrade A: barrel-origin jiggle-peek state
+        self.peek_owned_charge = False
+        self.peek_prev_mode = False
+        self.peek_home: Optional[Tuple[float, float]] = None
+        self.peek_axis: Tuple[float, float] = (0.0, 0.0)
+        self.peek_return_until = -10.0
+        self.peek_block_until = -10.0
+        self.peek_started_t = -10.0
+        self.peek_side = 0.0
+        self.peek_lock_until = -10.0
+        self.peek_plan: Optional[Tuple[int, float, float, float, float]] = None  # (target id, cx, cy, s, planned_t)
 
     def _pick_upgrade(self, offer: mf.Offer, weapons: List[Optional[mf.WeaponObs]]) -> int:
         held = {w["kind"] for w in weapons if w is not None}
@@ -397,6 +437,122 @@ class Bot:
         for eid in list(self.mem_enemies.keys()):
             if t - self.mem_enemies[eid][1] > 8.0:
                 del self.mem_enemies[eid]
+
+    def laser_safe_for(self, eid: int, now: float, window: float) -> bool:
+        """True only if enemy eid was OBSERVED firing its laser and the cooldown outlasts `window`.
+        Missing entry defaults to -1e9 => UNSAFE."""
+        return self.enemy_laser_ready.get(eid, -1e9) - now > window
+
+    def _rear_or_close_threat(self, t: float, x: float, y: float, yaw0: float, pid: int) -> bool:
+        """Veto peeking while another (remembered <=4 s) enemy is close, or behind our torso aim (rear armor is 1.5x)."""
+        for eid2, (ep2, seen) in self.mem_enemies.items():
+            if eid2 == pid or t - seen > 4.0:
+                continue
+            d2 = dist2d((x, y), (ep2[0], ep2[1]))
+            if d2 < 55.0:
+                return True
+            if d2 < 110.0 and abs(angle_diff(math.atan2(ep2[1] - y, ep2[0] - x), yaw0)) > math.pi * 0.52:
+                return True
+        return False
+
+    def _goal_clear(
+        self, goal: Tuple[float, float], muzzle_h: float, z: float, shot_offset: float, tp: List[float], tgt: List[float]
+    ) -> bool:
+        gx, gy = goal
+        gm = [gx, gy, self.map.support_z(gx, gy, z) + muzzle_h]
+        gyaw = math.atan2(tp[1] - gy, tp[0] - gx)
+        gpit = math.atan2(tgt[2] - gm[2], max(0.1, math.hypot(tp[0] - gx, tp[1] - gy)))
+        return self.map.barrel_clear(gm, gyaw, gpit, shot_offset, tgt)
+
+    def _find_peek(
+        self,
+        t: float,
+        pos: List[float],
+        muzzle_h: float,
+        radius: float,
+        height: float,
+        shot_offset: float,
+        tp: List[float],
+        z_off: float,
+        zone: mf.ZoneObs,
+        others: List[mf.ActorObs],
+        strict_edge: bool,
+        pid: int,
+        needs_ledger: bool,
+        aim: List[float],
+        turn_rate: float,
+        pitch_rate: float,
+        walk_v: float,
+        rem_pre: float,
+    ) -> Optional[Tuple[float, float, float]]:
+        """Smallest lateral side-step (|s| <= 4.5 m) whose REAL barrel ray (muzzle + radius+0.5 ahead) reaches the target,
+        with wall/slope/ledge checks along the walk and a LOS veto against other enemies. Soft-capped at ~1.4 ms."""
+        t0 = time.perf_counter()
+        x, y, z = pos[0], pos[1], pos[2]
+        theta = math.atan2(tp[1] - y, tp[0] - x)
+        nx, ny = -math.sin(theta), math.cos(theta)
+        zr = max(4.0, zone["radius"] - min(6.0, zone["radius"] * 0.2))
+        zcx, zcy = zone["center"]
+        locked = t < self.peek_lock_until and self.peek_side != 0.0
+        pref = self.peek_side if locked else self.strafe_dir
+        if locked:
+            offs = sorted((-1.5, 1.5, -3.0, 3.0, -4.5, 4.5), key=lambda s: (0 if s * pref > 0 else 1, abs(s)))
+        else:
+            offs = sorted((-1.5, 1.5, -3.0, 3.0, -4.5, 4.5), key=lambda s: (abs(s), 0 if s * pref > 0 else 1))
+        tgt = [tp[0], tp[1], tp[2] + z_off]
+        for s in offs:
+            if time.perf_counter() - t0 > 0.0014:
+                break
+            ux, uy = (nx, ny) if s > 0.0 else (-nx, -ny)
+            dist = abs(s)
+            cx, cy = x + nx * s, y + ny * s
+            if dist2d((cx, cy), (zcx, zcy)) > zr:
+                continue
+            ok = True
+            for q in (1.5, 3.0, 4.5):
+                if q > dist + 1e-6:
+                    break
+                if self.map.wall_height_along(x, y, z, ux, uy, q, radius, height, self.step_up) > 0.0:
+                    ok = False
+                    break
+                sup = self.map.support_z(x + ux * q, y + uy * q, z)
+                if abs(sup - z) > 1.5 or (strict_edge and sup < z - 0.6):
+                    ok = False
+                    break
+            if not ok:
+                continue
+            if strict_edge:
+                # never step so far that the body overhangs a ledge
+                if self.map.support_z(cx + ux * (radius + 0.8), cy + uy * (radius + 0.8), z) < z - 0.6:
+                    continue
+            cz = self.map.support_z(cx, cy, z)
+            cm = [cx, cy, cz + muzzle_h]
+            tyaw = math.atan2(tp[1] - cy, tp[0] - cx)
+            tpit = math.atan2(tgt[2] - cm[2], max(0.1, math.hypot(tp[0] - cx, tp[1] - cy)))
+            if needs_ledger:
+                tpeek = dist / max(1.0, 0.5 * walk_v)  # laser charge halves movement speed
+                taim = max(
+                    abs(angle_diff(tyaw, aim[0])) / max(0.5, turn_rate),
+                    abs(tpit - aim[1]) / max(0.5, pitch_rate),
+                )
+                # Fast <=1.6m peek (tpeek+taim < 0.36s) beats an uncharged enemy's >=0.42s laser charge;
+                # deeper peeks require observed cooldown + 0.42s enemy charge to outlast our exposure.
+                if tpeek + taim > 0.36:
+                    req_cd = max(0.0, rem_pre + tpeek + taim + 0.15 - 0.42)
+                    if not self.laser_safe_for(pid, t, req_cd):
+                        continue
+            if not self.map.barrel_clear(cm, tyaw, tpit, shot_offset, tgt):
+                continue
+            exposed = False
+            for ot in others[:2]:
+                op = ot["pos"]
+                if self.map.has_los(cm, [op[0], op[1], op[2] + 4.5], step_m=4.0):
+                    exposed = True
+                    break
+            if exposed:
+                continue
+            return (cx, cy, s)
+        return None
 
     def _predict_slewed_aim(
         self, cur_aim: List[float], cmd_yaw: float, cmd_pitch: float, turn_rate: float, pitch_rate: float, dt: float = 0.05
@@ -513,8 +669,8 @@ class Bot:
                         if d_perp < radius + 0.8:
                             urgent = True
 
-        # Round-2 Phase-2 Winner: Exact Enemy Laser Charge-Window Timing!
-        # Enemy laser charges 0.75s -> keep punishing during first 0.35s, then snap to cover at 0.35..0.95s!
+        # Round-2 Phase-2 Winner: Enemy Laser Charge-Window Timing (V12: threshold 0.28 s, since 2x laser_charge => 0.42 s charge).
+        # Keep punishing during the first 0.28s of an observed charge, then snap to cover!
         for e in enemies:
             if e.get("charging"):
                 ep = e["pos"]
@@ -528,7 +684,7 @@ class Bot:
                     if d_ray < radius + 5.5:
                         eid = int(e["id"])
                         elapsed = t - self.enemy_charge_start.get(eid, t)
-                        if elapsed >= 0.35:
+                        if elapsed >= self.LASER_DANGER_T:
                             lethal_laser_threats.append(e)
                             nx, ny = -ldy, ldx
                             if nx * cx + ny * cy < 0:
@@ -656,6 +812,7 @@ class Bot:
         return best_dir, need_jump, need_jet
 
     def act(self, obs: mf.Observation) -> mf.Action:
+        t_start = time.perf_counter()
         me = obs["self"]
         t = float(obs["t"])
         tick = int(obs["tick"])
@@ -699,8 +856,17 @@ class Bot:
                 self.last_combat_t = t
         for bm in obs["beams"]:
             if bm["path"]:
-                self.beam_threats[int(bm["by"])] = (bm["path"][0], t)
+                bid = int(bm["by"])
+                self.beam_threats[bid] = (bm["path"][0], t)
+                if bm.get("kind") == "laser":
+                    # Observed laser release => exact cooldown ledger for that shooter id
+                    shot_t = t - float(bm.get("age", 0.0) or 0.0)
+                    self.enemy_laser_ready[bid] = shot_t + self.laser_cd
+                    self.enemy_charge_start.pop(bid, None)
         self.beam_threats = {k: v for k, v in self.beam_threats.items() if t - v[1] < 2.5}
+        if self.enemy_laser_ready:
+            for k in [k for k, v in self.enemy_laser_ready.items() if v < t - 6.0]:
+                del self.enemy_laser_ready[k]
 
         if self.last_pos is not None and dist2d((x, y), self.last_pos) < 0.14:
             self.stuck_ticks += 1
@@ -843,6 +1009,107 @@ class Bot:
             and hp_frac >= 0.38
         )
 
+        # 5b. V12 Upgrade A: true barrel-origin laser jiggle-peek.
+        # Precharge while covered -> side-step (half speed) until the REAL barrel ray is clear -> release -> return home.
+        peek_mode = False
+        peek_go = False
+        peek_goal: Optional[Tuple[float, float]] = None
+        peek_slot: Optional[int] = None
+        laser_slot: Optional[int] = None
+        for idx_w, w in enumerate(weapons):
+            if w is not None and w["kind"] == "laser":
+                laser_slot = idx_w
+                break
+        walk_v = float(stats.get("walk_speed", stats.get("speed", 11.7)))
+        if (
+            self.ENABLE_PEEK
+            and laser_slot is not None
+            and me["grounded"]
+            and not zone_urgent
+            and not lethal_lasers
+            and not dodge_urgent
+            and not capturing_drop
+            and self.climbing_roof is None
+            and hp_frac >= 0.40
+            and t >= self.peek_block_until
+            and t - self.last_damage_t > 0.8
+            and len(enemies_with_los) <= 1
+            and (time.perf_counter() - t_start) < 0.0025
+        ):
+            pw = weapons[laser_slot]
+            assert pw is not None
+            p_charge = float(pw.get("charge", 0.0))
+            pe = best_los_enemy if best_los_enemy is not None else best_any_enemy
+            if pe is not None and (float(pw["cooldown"]) <= 0.05 or p_charge > 0.0) and not pe.get("charging"):
+                pws = pw["stats"]
+                max_c = float(pws.get("charge", 0.75))
+                hold_s = float(pws.get("hold_s", 2.0))
+                pep = pe["pos"]
+                pid = int(pe["id"])
+                z_off_p = 4.5 * (1.0 + self.size_per_cube * float(pe.get("cubes", 0.0)))
+                d_pe = dist3d(pos, pep)
+                if 38.0 <= d_pe <= min(float(pws.get("range", 280.0)) - 5.0, 150.0):
+                    tgt_pt = [pep[0], pep[1], pep[2] + z_off_p]
+                    yaw0 = math.atan2(pep[1] - y, pep[0] - x)
+                    pit0 = math.atan2(tgt_pt[2] - muzzle[2], max(0.1, dist2d((x, y), (pep[0], pep[1]))))
+                    has_l = "laser" in pe.get("weapons", ["laser"])
+                    rem_pre = max(0.0, 0.88 * max_c - p_charge)
+                    if not self._rear_or_close_threat(t, x, y, yaw0, pid):
+                        if self.map.barrel_clear(muzzle, yaw0, pit0, shot_offset, tgt_pt):
+                            # Real barrel ray already clear: fire phase if we own a charge, or if muzzle-center LOS missed a clear barrel.
+                            if (p_charge > 0.0 and self.peek_owned_charge) or best_los_enemy is None:
+                                taim0 = max(
+                                    abs(angle_diff(yaw0, me["aim"][0])) / max(0.5, turn_rate),
+                                    abs(pit0 - me["aim"][1]) / max(0.5, pitch_rate),
+                                )
+                                req_cd0 = max(0.0, rem_pre + taim0 + 0.15 - 0.42)
+                                if (not has_l) or (rem_pre + taim0 <= 0.36) or self.laser_safe_for(pid, t, req_cd0):
+                                    peek_mode = True
+                                    peek_slot = laser_slot
+                                    if self.peek_plan is None or self.peek_plan[0] != pid:
+                                        self.peek_axis = (-math.sin(yaw0) * self.strafe_dir, math.cos(yaw0) * self.strafe_dir)
+                        else:
+                            found: Optional[Tuple[float, float, float]] = None
+                            pl = self.peek_plan
+                            if (
+                                pl is not None
+                                and pl[0] == pid
+                                and self.peek_prev_mode
+                                and t - pl[4] < 1.5
+                                and self._goal_clear((pl[1], pl[2]), muzzle_h, z, shot_offset, pep, tgt_pt)
+                            ):
+                                # Keep the SAME goal for the whole attempt (re-planning from a dithered position inflates |s|)
+                                found = (pl[1], pl[2], pl[3])
+                            else:
+                                others = sorted(
+                                    (o for o in enemies if int(o["id"]) != pid and dist2d((x, y), (o["pos"][0], o["pos"][1])) < 140.0),
+                                    key=lambda o: dist2d((x, y), (o["pos"][0], o["pos"][1])),
+                                )
+                                found = self._find_peek(
+                                    t, pos, muzzle_h, my_radius, my_height, shot_offset, pep, z_off_p, zone, others,
+                                    on_roof or keep_on_roof, pid, has_l, me["aim"], turn_rate, pitch_rate, walk_v, rem_pre,
+                                )
+                                if found is not None:
+                                    self.peek_plan = (pid, found[0], found[1], found[2], t)
+                                    self.peek_side = 1.0 if found[2] > 0.0 else -1.0
+                                    self.peek_lock_until = t + 0.6  # side hysteresis
+                                    self.peek_axis = (-math.sin(yaw0) * self.peek_side, math.cos(yaw0) * self.peek_side)
+                                else:
+                                    self.peek_plan = None
+                            if found is not None:
+                                peek_mode = True
+                                peek_slot = laser_slot
+                                peek_goal = (found[0], found[1])
+                                gd = dist2d((x, y), peek_goal)
+                                peek_go = (p_charge >= 0.88 * max_c) and ((max_c + hold_s - p_charge) > gd / max(1.0, 0.5 * walk_v) + 0.35)
+        if peek_mode:
+            if not self.peek_prev_mode:
+                self.peek_started_t = t
+                self.peek_home = (x, y)
+            elif t - self.peek_started_t > 2.4:
+                peek_mode, peek_go, peek_goal, peek_slot = False, False, None, None
+                self.peek_block_until = t + 2.5
+
         # Persistent Memory Weapon Rush (up to 195m when Slot 1 empty or holding Mortar!)
         want_weapon_pos: Optional[Tuple[str, List[float]]] = None
         if weapons[1] is None or "mortar" in held_kinds:
@@ -863,6 +1130,25 @@ class Bot:
             best_crate_pos = min((cpos for cpos, _ in self.mem_crates.values()), key=lambda cpos: dist3d(pos, cpos))
 
         roof = self._best_roof(x, y, zone)
+
+        # V12 Upgrade C: ledge-punish. Only when every LOS enemy is >=4 m below and its OBSERVED laser cooldown outlasts our retreat.
+        roof_punish_ok = False
+        if (
+            self.ENABLE_LEDGER_ROOF
+            and cur_roof is not None
+            and best_los_enemy is not None
+            and not zone_urgent
+            and not lethal_lasers
+            and 0.40 <= hp_frac < 0.50
+            and len(enemies_with_los) <= 2
+            and all(e["pos"][2] < z - 4.0 and not e.get("charging") for e in enemies_with_los)
+        ):
+            dc_roof = dist2d((x, y), (cur_roof.cx, cur_roof.cy))
+            win_roof = min(0.8, dc_roof / max(1.0, walk_v)) + 0.20
+            roof_punish_ok = self.laser_safe_for(int(best_los_enemy["id"]), t, win_roof) and all(
+                ("laser" not in e.get("weapons", ["laser"])) or self.laser_safe_for(int(e["id"]), t, win_roof)
+                for e in enemies_with_los
+            )
 
         if zone_urgent:
             goal_xy = (zcx, zcy)
@@ -888,7 +1174,7 @@ class Bot:
             goal_xy = (best_drop["pos"][0], best_drop["pos"][1])
             keep_on_roof = False
             state_label = "drop-cap"
-        elif hp_frac < 0.50 and enemies_with_los:
+        elif hp_frac < 0.50 and enemies_with_los and not roof_punish_ok:
             if cur_roof is not None and all(e["pos"][2] < z - 4.0 for e in enemies_with_los):
                 # Round-2 Phase-3 Winner: Roof-Center Regen! Step inward to break ground LOS & heal!
                 goal_xy = (cur_roof.cx, cur_roof.cy)
@@ -906,6 +1192,13 @@ class Bot:
                 want_zero_los = True
                 want_boost = energy > 24.0 and charging_laser_slot is None
                 state_label = "escape-cover"
+        elif roof_punish_ok:
+            # Enemy laser verified on cooldown: hold the ledge (edge-lock stays active) and keep gun/laser pressure instead of center-ducking.
+            pe_yaw = math.atan2(best_los_enemy["pos"][1] - y, best_los_enemy["pos"][0] - x)
+            sa = pe_yaw + self.strafe_dir * (math.pi * 0.5)
+            goal_xy = (x + math.cos(sa) * 8.0, y + math.sin(sa) * 8.0)
+            keep_on_roof = True
+            state_label = "roof-punish"
         elif want_weapon_pos is not None and closest_los_dist > 34.0 and hp_frac > 0.42:
             goal_xy = (want_weapon_pos[1][0], want_weapon_pos[1][1])
             want_boost = energy > 32.0 and charging_laser_slot is None
@@ -955,7 +1248,7 @@ class Bot:
                 goal_xy = (x + mx * 30.0, y + my * 30.0)
                 want_boost = energy > 48.0 and d_en < 52.0 and charging_laser_slot is None
                 state_label = f"kite-{best_los_enemy['id']:.0f}"
-        elif roof is not None and not on_roof and has_laser and energy > 55.0 and zone["radius"] > 75.0:
+        elif (not peek_mode) and roof is not None and not on_roof and has_laser and energy > 55.0 and zone["radius"] > 75.0:
             self.climbing_roof = roof
             goal_xy = (roof[0], roof[1])
             allow_climb = True
@@ -1006,6 +1299,42 @@ class Bot:
                 keep_on_roof,
                 energy,
             )
+
+        if peek_mode and peek_slot is not None:
+            want_boost = False
+            need_jump = False
+            need_jet = False
+            self.stuck_ticks = 0
+            pgoal = peek_goal
+            if pgoal is None and self.peek_plan is not None and t - self.peek_plan[4] < 1.6:
+                pgoal = (self.peek_plan[1], self.peek_plan[2])
+            gd2 = dist2d((x, y), pgoal) if pgoal is not None else 0.0
+            if peek_go and pgoal is not None and gd2 > 0.3:
+                move_vec = [(pgoal[0] - x) / gd2, (pgoal[1] - y) / gd2]
+                state_label = "peek-go"
+            else:
+                # Hold exact covered spot while precharging, or hold exact clear spot while releasing hitscan beam
+                move_vec = [0.0, 0.0]
+                state_label = "peek-fire" if (peek_goal is None) else "peek-chg"
+        elif (
+            t < self.peek_return_until
+            and self.peek_home is not None
+            and not zone_urgent
+            and not dodge_urgent
+            and not lethal_lasers
+            and me["grounded"]
+        ):
+            hx, hy = self.peek_home
+            hd = dist2d((x, y), (hx, hy))
+            if 0.5 < hd < 9.0:
+                hux, huy = (hx - x) / hd, (hy - y) / hd
+                if (
+                    self.map.wall_height_along(x, y, z, hux, huy, min(hd, 3.0), my_radius, my_height, self.step_up) <= 0.0
+                    and abs(self.map.support_z(hx, hy, z) - z) <= 1.5
+                ):
+                    move_vec = [hux, huy]
+                    need_jump = False
+                    need_jet = False
 
         jump_cmd = False
         if need_jet or (self.climbing_roof is not None and not me["grounded"] and z < self.climbing_roof[2] + 0.5):
@@ -1082,7 +1411,9 @@ class Bot:
             aim_yaw, aim_pitch = direct_yaw, direct_pitch
 
             primary_slot: Optional[int] = None
-            if charging_laser_slot is not None and target_los:
+            if peek_mode and peek_slot is not None:
+                primary_slot = peek_slot
+            elif charging_laser_slot is not None and target_los:
                 primary_slot = charging_laser_slot
             else:
                 primary_score = -1.0
@@ -1130,7 +1461,7 @@ class Bot:
                     min_c = float(ws.get("min_charge", 0.15))
                     hold_s = float(ws.get("hold_s", 2.0))
                     # Round-2 Phase-2 Winner: Lead-aim & fire Gun up to 84% of Laser charge, then snap to hitscan!
-                    if charge < max_c * 0.84 and ow is not None and ow["kind"] == "gun" and float(ow.get("reload", 0.0)) == 0.0 and d_tgt <= float(ow["stats"].get("range", 230.0)) - 5.0:
+                    if (not peek_mode) and charge < max_c * 0.84 and ow is not None and ow["kind"] == "gun" and float(ow.get("reload", 0.0)) == 0.0 and d_tgt <= float(ow["stats"].get("range", 230.0)) - 5.0:
                         aim_yaw, aim_pitch = self._lead_aim(muzzle, target_pos, target_vel, float(ow["stats"].get("speed", 252.0)), target_z_off, shot_offset)
                         fire[primary_slot] = True
                     else:
@@ -1142,7 +1473,15 @@ class Bot:
                         about_to_autofire = charge >= (max_c + hold_s - 0.20)
                         ready_to_release = (charge >= max_c * 0.88) or (target_hp < 155.0 and charge >= min_c)
                         if (ready_to_release or about_to_autofire) and yaw_err <= hit_tol and pitch_err <= hit_tol * 1.4:
-                            fire[primary_slot] = False
+                            # V12: release only through a geometrically valid barrel ray (hitscan leaves from radius+0.5 ahead of the muzzle)
+                            if about_to_autofire or self.map.barrel_clear(
+                                muzzle, pyaw, ppitch, shot_offset, [target_pos[0], target_pos[1], target_pos[2] + target_z_off]
+                            ):
+                                fire[primary_slot] = False
+                                if peek_mode:
+                                    self.peek_return_until = t + 1.0
+                            else:
+                                fire[primary_slot] = True
                         elif w["cooldown"] <= 0.05 or charge > 0.0:
                             fire[primary_slot] = True
                 elif k == "mortar":
@@ -1168,7 +1507,11 @@ class Bot:
                     pyaw, _ = self._predict_slewed_aim(me["aim"], aim_yaw, aim_pitch, turn_rate, pitch_rate)
                     if ok == "gun" and float(ow.get("reload", 0.0)) == 0.0 and d_tgt <= float(ows.get("range", 230.0)) - 5.0:
                         if abs(angle_diff(pyaw, aim_yaw)) < 0.15:
-                            fire[other] = True
+                            # V12: while the laser is charging, the gun must also leave through a clear barrel (no rounds into geometry)
+                            if (charging_laser_slot is None and k != "laser") or self.map.barrel_clear(
+                                muzzle, pyaw, aim_pitch, shot_offset, [target_pos[0], target_pos[1], target_pos[2] + target_z_off]
+                            ):
+                                fire[other] = True
                     elif ok == "lightning" and energy > 10.0 and d_tgt <= float(ows.get("range", 45.0)) - 1.0:
                         cone_half = math.radians(float(ows.get("cone_deg", 30.0)) * 0.46)
                         if abs(angle_diff(pyaw, direct_yaw)) <= cone_half:
@@ -1201,6 +1544,15 @@ class Bot:
                 if w is not None and w["kind"] == "gun" and not fire[idx_w] and float(w.get("reload", 0.0)) == 0.0:
                     if float(w.get("ammo", 12)) < float(w["stats"].get("mag", 12)) * 0.75:
                         act["reload"] = True
+
+        # V12: a charge started by the peek planner must not sit at half speed into a wall once the peek is no longer valid
+        if self.peek_owned_charge and not peek_mode and charging_laser_slot is not None and not target_los:
+            fire[charging_laser_slot] = False
+        self.peek_prev_mode = peek_mode
+        if peek_mode:
+            self.peek_owned_charge = True
+        elif charging_laser_slot is None:
+            self.peek_owned_charge = False
 
         act["aim"] = [aim_yaw, clamp(aim_pitch, min_pitch, max_pitch)]
         act["fire"] = fire
